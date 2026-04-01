@@ -317,9 +317,158 @@ fork path 的设计目标是：
 
 所以远程模式其实是把权限交互也“隧道化”了。
 
-## 12. 多代理体系总图
+## 12. `0402.md` 里那批隐藏能力在多代理链路里的真实落点
+
+### 12.1 Coordinator 是独立编排人格，不是普通 worker 开关
+
+关键代码：
+
+- `src/coordinator/coordinatorMode.ts`
+- `src/constants/tools.ts`
+
+`isCoordinatorMode()` 的条件很直接：
+
+- build-time 要有 `feature('COORDINATOR_MODE')`
+- runtime 要有 `CLAUDE_CODE_COORDINATOR_MODE`
+
+进入 coordinator mode 之后，主线程可见工具会被强约束到：
+
+- `AgentTool`
+- `TaskStopTool`
+- `SendMessageTool`
+- `SyntheticOutputTool`
+
+也就是 `COORDINATOR_MODE_ALLOWED_TOOLS` 这一小组。
+
+同时，`coordinatorMode.ts` 里的 `INTERNAL_WORKER_TOOLS` 又会从 worker 可见工具上下文里剔除：
+
+- `TeamCreate`
+- `TeamDelete`
+- `SendMessage`
+- `SyntheticOutput`
+
+因此 `0402.md` 里“worker 拿不到 TeamCreate 和 SendMessage，防止套娃”这个说法，在 coordinator 语义下基本成立。源码的真实表达不是一句注释，而是：
+
+- coordinator 自己有一套单独 system prompt
+- worker 工具表是被 coordinator 运行时二次裁剪过的
+
+### 12.2 “tmux / in-process / remote” 这个说法方向对，但要拆成两层看
+
+关键代码：
+
+- `src/tools/shared/spawnMultiAgent.ts`
+- `src/utils/swarm/backends/registry.ts`
+- `src/utils/swarm/backends/types.ts`
+- `src/tools/AgentTool/AgentTool.tsx`
+
+代码里真正的 teammate backend 类型是：
+
+- `tmux`
+- `iterm2`
+- `in-process`
+
+`spawnMultiAgent.ts` 和 backend registry 说明：
+
+- 如果会话解析成 `in-process`，worker 直接在当前进程里跑。
+- 如果需要 pane backend，则优先走当前终端环境可用的 `tmux` 或 `iTerm2`。
+- `auto` 模式会在 pane backend 不可用时回退到 `in-process`。
+
+而 `remote` 不是 teammate pane backend 的第四种枚举，而是 `AgentTool` 的 isolation 模式：
+
+- `src/tools/AgentTool/AgentTool.tsx` 中 `effectiveIsolation === 'remote'`
+- 随后走 `teleportToRemote(...)` + `registerRemoteAgentTask(...)`
+
+所以更准确的说法是：
+
+> teammate 执行后端是 `tmux / iTerm2 / in-process`，而 `remote` 是 AgentTool 级别的远程隔离路径。
+
+### 12.3 Teleport 不是边缘命令，而是所有远程能力的公共底座
+
+关键代码：
+
+- `src/utils/teleport.tsx`
+- `src/main.tsx`
+- `src/tools/AgentTool/AgentTool.tsx`
+
+`teleportToRemote(...)` 这条链同时被多处复用：
+
+- `main.tsx` 的 `--remote` / `--teleport`
+- `AgentTool` 的 `remote` isolation
+- `/ultraplan`
+- `/ultrareview`
+
+它做的事也不只是“恢复一个网页 session”，而是：
+
+- 选择 GitHub clone 还是 bundle 模式
+- 创建远程 CCR session
+- 注入环境变量与初始消息
+- 返回 session URL / session id 给本地任务系统
+
+从架构上看，Teleport 更像：
+
+> Claude Code 所有云端执行能力共享的远程会话原语。
+
+### 12.4 `/ultraplan` 确实是一个云端 30 分钟规划工作流
+
+关键代码：
+
+- `src/commands/ultraplan.tsx`
+- `src/tasks/RemoteAgentTask/RemoteAgentTask.tsx`
+
+`ultraplan.tsx` 里有非常直白的常量：
+
+- `ULTRAPLAN_TIMEOUT_MS = 30 * 60 * 1000`
+
+它的主流程是：
+
+1. 通过 `teleportToRemote(...)` 创建远程 session。
+2. 把 planning prompt 发到远端。
+3. 用 `pollForApprovedExitPlanMode(...)` 轮询远端 plan approval。
+4. 根据用户在浏览器里的选择，决定：
+   - 继续在远端执行
+   - 还是把计划带回本地
+
+`RemoteAgentTaskState` 里还专门为它保留了：
+
+- `isUltraplan`
+- `ultraplanPhase`
+
+这说明 `/ultraplan` 不是普通 slash command 包了一层 prompt，而是独立的远程任务类型。
+
+### 12.5 `/ultrareview` 是 remote bughunter 路径，和 `/review` 不是一回事
+
+关键代码：
+
+- `src/commands/review.ts`
+- `src/commands/review/ultrareviewEnabled.ts`
+- `src/commands/review/reviewRemote.ts`
+
+`review.ts` 已经把两者拆得很清楚：
+
+- `/review` 保持本地 review prompt
+- `/ultrareview` 是唯一的 remote bughunter 入口
+
+`ultrareviewEnabled.ts` 说明它还受 `tengu_review_bughunter_config` 控制，未开 gate 时命令根本不会出现在命令表里。
+
+`reviewRemote.ts` 进一步证明了 `0402.md` 里的“云端 bug fleet”不是夸张修辞：
+
+- 默认 `BUGHUNTER_FLEET_SIZE = 5`
+- 上限 `20`
+- 默认最长运行 `10` 分钟
+- 上限 `25` 分钟
+- 结果通过 `registerRemoteAgentTask({ remoteTaskType: 'ultrareview' })` 回流本地会话
+
+因此 `/ultrareview` 的真实代码形态不是“增强版 review prompt”，而是：
+
+> 远程 session + bughunter 环境变量 + 轮询回流任务通知 的组合工作流。
+
+## 13. 多代理体系总图
 
 ```mermaid
+---
+config:
+  theme: neutral
+---
 flowchart TB
     A[主线程 query] --> B[AgentTool]
     B --> C{spawn mode}
@@ -338,9 +487,9 @@ flowchart TB
     L --> N[permission control flow]
 ```
 
-## 13. 架构观察
+## 14. 架构观察
 
-## 13.1 Agent 是“工具化的工作单元”
+## 14.1 Agent 是“工具化的工作单元”
 
 它之所以强大，是因为它同时复用了：
 
@@ -350,13 +499,13 @@ flowchart TB
 - transcript 系统
 - MCP 系统
 
-## 13.2 背景任务是 agent 生命周期的可视化投影
+## 14.2 背景任务是 agent 生命周期的可视化投影
 
 后台任务并不是另一个执行系统，而是：
 
 - 对 agent lifecycle 的状态化包装
 
-## 13.3 远程会话是同协议延伸
+## 14.3 远程会话是同协议延伸
 
 远程会话仍然说的是：
 
@@ -365,7 +514,7 @@ flowchart TB
 
 这让本地与远程之间可以共用大量上层逻辑。
 
-## 14. 关键源码锚点
+## 15. 关键源码锚点
 
 | 主题 | 代码锚点 | 说明 |
 | --- | --- | --- |
@@ -376,8 +525,13 @@ flowchart TB
 | 前台转后台 | `src/tasks/LocalAgentTask/LocalAgentTask.tsx:526-614` | foreground/background 切换 |
 | runAgent 主体 | `src/tools/AgentTool/runAgent.ts:430-860` | 子代理上下文构造与 query 运行 |
 | 远程会话管理 | `src/remote/RemoteSessionManager.ts:87-260` | WS/HTTP/control message 流 |
+| coordinator mode | `src/coordinator/coordinatorMode.ts` | coordinator prompt 与 worker 工具围栏 |
+| teammate backend 选择 | `src/utils/swarm/backends/registry.ts:335-430` | `auto / tmux / in-process` 的真实解析点 |
+| remote teleport 原语 | `src/utils/teleport.tsx:737-1189` | 远程 session 创建、bundle / git source 选择 |
+| `/ultraplan` | `src/commands/ultraplan.tsx:1-240` | 30 分钟远程 planning 与 phase 轮询 |
+| `/ultrareview` | `src/commands/review.ts`, `src/commands/review/reviewRemote.ts` | 本地 review 与远程 bughunter 的分叉 |
 
-## 15. 总结
+## 16. 总结
 
 多代理体系的核心设计是：
 

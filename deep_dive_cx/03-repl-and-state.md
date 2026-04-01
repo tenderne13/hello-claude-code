@@ -32,7 +32,11 @@
 整体装配大致如下：
 
 ```mermaid
-flowchart TB
+---
+config:
+  theme: neutral
+---
+flowchart LR
     A[launchRepl] --> B[App]
     B --> C[FpsMetricsProvider]
     C --> D[StatsProvider]
@@ -343,6 +347,10 @@ REPL 可以接受：
 ## 15. 一次完整交互在 REPL 中的流动图
 
 ```mermaid
+---
+config:
+  theme: neutral
+---
 flowchart LR
     A[PromptInput 回车] --> B[REPL.onSubmit]
     B --> C[awaitPendingHooks]
@@ -359,7 +367,147 @@ flowchart LR
     M --> N[setMessages / setStreamingState]
 ```
 
-## 16. 源码阅读顺序
+## 16. REPL 上还挂着几套容易被低估的前台子系统
+
+`doc/0402.md` 里提到的 `Bridge`、`Voice`、`BUDDY`、`Inbox`，并不是落在仓库边角的彩蛋；它们大多直接挂在 REPL 外壳和 `AppState` 上。
+
+### 16.1 Bridge 不是一个对话框，而是一条双向远程控制链
+
+关键代码：
+
+- `src/state/AppStateStore.ts`
+- `src/commands/bridge/bridge.tsx`
+- `src/bridge/replBridge.ts`
+
+从 `AppStateStore.ts` 可以直接看到一整套 `replBridge*` 状态：
+
+- `replBridgeEnabled`
+- `replBridgeConnected`
+- `replBridgeSessionActive`
+- `replBridgeReconnecting`
+- `replBridgeConnectUrl`
+- `replBridgeSessionUrl`
+- `replBridgeEnvironmentId`
+- `replBridgeSessionId`
+
+`/remote-control` 命令本身并不执行桥接逻辑，它做的是：
+
+1. 修改 `replBridgeEnabled` / `replBridgeExplicit` 之类的状态位。
+2. 让 `REPL.tsx` 中的 bridge hook 去真正建立连接。
+
+`src/bridge/replBridge.ts` 则给出了这条链的真实边界：
+
+- 注册环境
+- 创建 bridge session
+- 建立 ingress WebSocket
+- 同步消息与 SDK message
+- 转发 control request / response
+- 处理 reconnect、heartbeat、teardown
+
+所以 `Bridge` 的代码级定义不是“生成一个二维码给网页扫”，而是：
+
+> 把本地 REPL 变成 claude.ai / code 侧 session 的双向 worker。
+
+### 16.2 Voice 是一套原生音频链路，不是输入框小功能
+
+关键代码：
+
+- `src/state/AppState.tsx`
+- `src/context/voice.tsx`
+- `src/hooks/useVoiceIntegration.tsx`
+- `src/services/voice.ts`
+
+`AppStateProvider` 会在 `feature('VOICE_MODE')` 打开时包裹 `VoiceProvider`，这说明语音不是单个组件状态，而是会话级 Provider。
+
+`context/voice.tsx` 维护的是一份独立 voice store：
+
+- `voiceState`
+- `voiceError`
+- `voiceInterimTranscript`
+- `voiceAudioLevels`
+- `voiceWarmingUp`
+
+`useVoiceIntegration.tsx` 把按键事件、输入框插入、interim transcript、光标锚点拼成完整的 push-to-talk 体验；`services/voice.ts` 则负责真正的录音后端：
+
+- 优先 native `audio-capture-napi`
+- Linux 下可退回 `arecord`
+- 再不行则退回 `sox rec`
+
+所以 `0402.md` 里“Voice 原生语音交互引擎”这个判断在代码层是站得住的，至少当前树里保留了完整的 Provider、hook 和 native audio service 结构。
+
+### 16.3 Buddy / Companion 仍有完整前台与 prompt 痕迹，但命令入口在当前树里不完整
+
+关键代码：
+
+- `src/buddy/CompanionSprite.tsx`
+- `src/buddy/companion.ts`
+- `src/buddy/prompt.ts`
+- `src/screens/REPL.tsx`
+- `src/commands/buddy/index.ts`
+
+REPL 会直接渲染：
+
+- `CompanionSprite`
+- `CompanionFloatingBubble`
+
+`AppStateStore.ts` 里也有配套状态：
+
+- `companionReaction`
+- `companionPetAt`
+
+`buddy/prompt.ts` 进一步说明它不只是 UI 装饰。`getCompanionIntroAttachment()` 会把 companion 信息以 attachment 注入给主模型，并明确要求主模型：
+
+- 不要假装自己就是 companion
+- 用户在和 companion 说话时，主模型只做最小让位
+
+但当前反编译树里 `src/commands/buddy/index.ts` 是一个 auto-generated stub。也就是说：
+
+- companion 的 sprite、状态、prompt 注入链仍然存在
+- `/buddy` 这个命令入口在当前仓库快照里并不是完整实现
+
+因此 `BUDDY` 更准确的代码结论是：
+
+> 前台子系统和 prompt 接缝还在，但命令层实现并未在当前反编译树中完整保留。
+
+### 16.4 Inbox 不是单一路径，而是内存邮箱、文件邮箱和 UDS 接缝并存
+
+关键代码：
+
+- `src/context/mailbox.tsx`
+- `src/utils/mailbox.ts`
+- `src/utils/teammateMailbox.ts`
+- `src/setup.ts`
+- `src/utils/udsMessaging.ts`
+
+REPL 最外层会包 `MailboxProvider`。这里的 `Mailbox` 是一个进程内消息队列，用来承接：
+
+- teammate message
+- system message
+- task notification
+- tick 类信号
+
+而真正持久化的 teammate inbox 在 `teammateMailbox.ts`：
+
+- 存储路径是 `~/.claude/teams/<team>/inboxes/<agent>.json`
+- 写入时有 `.lock` 文件保证并发安全
+- unread / read 标记都是文件级状态
+
+这说明当前树里可明确验证的“跨会话通信”底座首先是：
+
+> 基于文件的 teammate mailbox，而不是抽象消息总线。
+
+与此同时，`UDS_INBOX` 这条线也真实存在：
+
+- `setup.ts` 会在 feature 打开时调用 `startUdsMessaging(...)`
+- `main.tsx` 支持 `messagingSocketPath`
+- `commands.ts` / `tools.ts` 会在 `UDS_INBOX` 打开时注册 `peers` 命令和 `ListPeersTool`
+
+但当前仓库里的 `src/utils/udsMessaging.ts` 是 stub。也就是说：
+
+- UDS 入口、命令门控和启动缝合点都还在
+- 真正能从当前树完整读通并验证的 durable inbox 机制，仍是文件邮箱这条链
+
+## 17. 源码阅读顺序
 
 推荐优先关注以下区段：
 
@@ -369,7 +517,7 @@ flowchart LR
 4. `onQueryImpl`：看 UI 如何拼出一次 query。
 5. 队列与 incoming prompt：看会话如何接纳非输入框来源的消息。
 
-## 17. 总结
+## 18. 总结
 
 `REPL.tsx` 的核心价值不是“渲染聊天窗口”，而是把整个交互运行时协调起来：
 

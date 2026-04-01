@@ -5,7 +5,11 @@
 ## 1. 架构分层图
 
 ```mermaid
-flowchart TB
+---
+config:
+  theme: 'neutral'
+---
+flowchart LR
     subgraph Entry[入口与启动]
         A1[main.tsx]
         A2[setup.ts]
@@ -387,6 +391,81 @@ flowchart TB
 - 通过 prompt cache break detection 监控 cache read 是否异常下降。
 
 这说明这套系统把“高上下文 Agent 成本控制”当成一等问题。
+
+## 7.4 `0402.md` 里的规模数字应按运行时口径理解
+
+`doc/0402.md` 里那组“`53` 个核心工具 / `87` 个 slash command / `148` 个 UI 组件 / `87` 个 hooks”的价值，不在于给源码树做文件统计，而在于提醒读者：
+
+- Claude Code 的能力面有几套非常明确的注册表。
+- 这些数字描述的是某个 build / runtime slice，而不是当前反编译仓库里的原始文件数。
+
+代码里最明确的两个“规模口径锚点”是：
+
+- `src/tools.ts#getAllBaseTools()`：内建工具总表，后续再由 `getTools()`、deny rule、simple mode、REPL mode 继续裁剪。
+- `src/commands.ts#COMMANDS()`：内建 slash command 注册表，之后 `getCommands()` 还会再并入 skill dir、bundled skills、plugin commands。
+
+这意味着：
+
+- “核心工具数”对应的是工具注册表，不是 `src/tools/**` 目录下有多少文件。
+- “slash command 数”对应的是命令注册表，不是 `src/commands/**` 下有多少目录。
+
+而 UI 与 hooks 的情况更分散：
+
+- UI 能力分布在 `src/components/*`、`src/screens/*`、`src/ink/*`。
+- hooks 分布在 `src/hooks/*`，但当前反编译树里还混有 wrapper、shim、lazy-loader 与部分生成产物。
+
+因此 `0402.md` 里的这组数字更适合被理解为：
+
+> Claude Code 在某个产品构建切面上的能力规模快照，而不是这份 reverse-engineered 仓库的源码文件快照。
+
+## 7.5 “三层门控”在代码里就是注册表层裁剪
+
+`0402.md` 提到的“三层门控”在源码里不是抽象说法，而是直接体现在命令和工具注册表上。
+
+### 编译时门控
+
+最外层是 build-time `feature('...')`：
+
+- `src/tools.ts` 里大量工具通过 `feature('HISTORY_SNIP')`、`feature('UDS_INBOX')`、`feature('WORKFLOW_SCRIPTS')` 等决定是否进入 `getAllBaseTools()`。
+- `src/commands.ts` 里 `/ultraplan`、`/bridge`、`/voice`、`/buddy`、`/peers` 等命令也都先过一层 `feature(...)`。
+- `src/main.tsx` 里 `KAIROS`、`COORDINATOR_MODE`、`BRIDGE_MODE` 等模块甚至在 import 层就被 dead-code elimination 裁掉。
+
+这一层决定的是：
+
+- 功能是否进 bundle
+- 字符串和模块是否存在
+- 外部构建里是不是连壳都没有
+
+### 用户类型门控
+
+第二层是 `process.env.USER_TYPE === 'ant'`：
+
+- `src/tools.ts` 里 `ConfigTool`、`TungstenTool`、`REPLTool` 等是 ant-only。
+- `src/commands.ts` 里 `INTERNAL_ONLY_COMMANDS` 只有 ant 用户才会并入可见命令表。
+- `src/tools/AgentTool/AgentTool.tsx` 里 remote isolation 的 schema 说明也带有 ant-only 分支。
+
+这一层决定的是：
+
+- 同一份代码在内部用户与外部用户面前暴露不同能力面
+- 某些能力在外部构建中即便保留了结构，也不会成为可见产品面
+
+### 远程配置门控
+
+第三层是 GrowthBook / Statsig 远程门控：
+
+- `src/main.tsx` 启动时会初始化 `GrowthBook`。
+- 运行时大量逻辑通过 `getFeatureValue_CACHED_MAY_BE_STALE('tengu_*')` 或 `checkStatsigFeatureGate_CACHED_MAY_BE_STALE(...)` 决定可见性与行为。
+- 典型例子包括：
+  - `/ultrareview` 依赖 `tengu_review_bughunter_config`
+  - bridge 轮询与版本约束依赖 `tengu_bridge_poll_interval_config`、`tengu_bridge_min_version`
+  - coordinator scratchpad 依赖 `tengu_scratch`
+  - ant 模型别名覆写依赖 `tengu_ant_model_override`
+
+因此同一份源码的真实能力面并不是单值，而是：
+
+> build-time 裁剪 + 用户类型裁剪 + 远程配置裁剪 共同决定的结果。
+
+`tengu_*` 也是当前树里最稳定、最密集的内部命名痕迹。与其把这些能力理解成一组零散彩蛋，不如把它们理解成被多层门控包裹的“条件性子系统”。
 
 ## 8. 关键源码锚点
 
